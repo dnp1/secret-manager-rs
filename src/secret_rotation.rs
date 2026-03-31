@@ -1,10 +1,18 @@
-use parking_lot::RwLock;
+#[cfg(feature = "arc-swap")]
+use arc_swap::ArcSwap;
+#[cfg(feature = "parking-lot")]
+use parking_lot::RwLock as ParkingRwLock;
+#[cfg(not(any(feature = "arc-swap", feature = "parking-lot")))]
+use std::sync::RwLock as StdRwLock;
+
+use std::sync::Arc;
 use tokio::sync::watch;
 
 // ---------------------------------------------------------------------------
 // Internal ring-buffer state
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 struct SecretInner<const V: usize, const S: usize> {
     /// Indexed by version (u8 cast to usize). Slot is `None` until first written.
     keys: [Option<[u8; S]>; V],
@@ -17,9 +25,26 @@ struct SecretInner<const V: usize, const S: usize> {
 
 /// An in-memory ring buffer of versioned secret keys, safe for concurrent use.
 pub struct SecretGroup<const V: usize = 256, const S: usize = 32> {
-    inner: RwLock<SecretInner<V, S>>,
+    #[cfg(feature = "arc-swap")]
+    inner: Arc<ArcSwap<SecretInner<V, S>>>,
+    
+    #[cfg(all(feature = "parking-lot", not(feature = "arc-swap")))]
+    inner: Arc<ParkingRwLock<SecretInner<V, S>>>,
+    
+    #[cfg(not(any(feature = "arc-swap", feature = "parking-lot")))]
+    inner: Arc<StdRwLock<SecretInner<V, S>>>,
+    
     /// Broadcasts the new `current_version` whenever `apply` is called.
-    rotation_tx: watch::Sender<u8>,
+    rotation_tx: Arc<watch::Sender<u8>>,
+}
+
+impl<const V: usize, const S: usize> Clone for SecretGroup<V, S> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            rotation_tx: self.rotation_tx.clone(),
+        }
+    }
 }
 
 impl<const V: usize, const S: usize> SecretGroup<V, S> {
@@ -35,24 +60,57 @@ impl<const V: usize, const S: usize> SecretGroup<V, S> {
         let mut keys: [Option<[u8; S]>; V] = std::array::from_fn(|_| None);
         keys[version as usize] = Some(initial_key);
 
+        let inner_val = SecretInner { keys, current_version: version };
+
         Self {
-            inner: RwLock::new(SecretInner { keys, current_version: version }),
-            rotation_tx,
+            #[cfg(feature = "arc-swap")]
+            inner: Arc::new(ArcSwap::from_pointee(inner_val)),
+            
+            #[cfg(all(feature = "parking-lot", not(feature = "arc-swap")))]
+            inner: Arc::new(ParkingRwLock::new(inner_val)),
+            
+            #[cfg(not(any(feature = "arc-swap", feature = "parking-lot")))]
+            inner: Arc::new(StdRwLock::new(inner_val)),
+            
+            rotation_tx: Arc::new(rotation_tx),
         }
     }
 
     /// Return `(current_version, key_bytes)`.
     pub fn current(&self) -> (u8, [u8; S]) {
-        let inner = self.inner.read();
-        let v = inner.current_version;
-        let key = inner.keys[v as usize]
+        #[cfg(feature = "arc-swap")]
+        let (v, keys) = {
+            let inner = self.inner.load();
+            (inner.current_version, inner.keys)
+        };
+
+        #[cfg(all(feature = "parking-lot", not(feature = "arc-swap")))]
+        let (v, keys) = {
+            let inner = self.inner.read();
+            (inner.current_version, inner.keys)
+        };
+
+        #[cfg(not(any(feature = "arc-swap", feature = "parking-lot")))]
+        let (v, keys) = {
+            let inner = self.inner.read().expect("lock poisoned");
+            (inner.current_version, inner.keys)
+        };
+
+        let key = keys[v as usize]
             .expect("current_version slot must always be populated");
         (v, key)
     }
 
     /// Look up a key by version. Returns `None` for slots that have never been written.
     pub fn resolve(&self, version: u8) -> Option<[u8; S]> {
-        self.inner.read().keys[version as usize]
+        #[cfg(feature = "arc-swap")]
+        return self.inner.load().keys[version as usize];
+
+        #[cfg(all(feature = "parking-lot", not(feature = "arc-swap")))]
+        return self.inner.read().keys[version as usize];
+
+        #[cfg(not(any(feature = "arc-swap", feature = "parking-lot")))]
+        return self.inner.read().expect("lock poisoned").keys[version as usize];
     }
 
     /// Subscribe to rotation events.
@@ -67,8 +125,25 @@ impl<const V: usize, const S: usize> SecretGroup<V, S> {
             "version {} out of range for ring buffer of size {V}",
             version
         );
-        let mut inner = self.inner.write();
-        inner.keys[version as usize] = Some(key);
+        
+        #[cfg(feature = "arc-swap")]
+        {
+            let mut inner = (**self.inner.load()).clone();
+            inner.keys[version as usize] = Some(key);
+            self.inner.store(Arc::new(inner));
+        }
+
+        #[cfg(all(feature = "parking-lot", not(feature = "arc-swap")))]
+        {
+            let mut inner = self.inner.write();
+            inner.keys[version as usize] = Some(key);
+        }
+
+        #[cfg(not(any(feature = "arc-swap", feature = "parking-lot")))]
+        {
+            let mut inner = self.inner.write().expect("lock poisoned");
+            inner.keys[version as usize] = Some(key);
+        }
     }
 
     /// Advance the `current_version` to `version` and notify subscribers.
@@ -78,20 +153,69 @@ impl<const V: usize, const S: usize> SecretGroup<V, S> {
             "version {} out of range for ring buffer of size {V}",
             version
         );
+
+        #[cfg(feature = "arc-swap")]
+        {
+            let mut inner = (**self.inner.load()).clone();
+            if inner.keys[version as usize].is_none() {
+                panic!("cannot promote version {version} before it is stored");
+            }
+            inner.current_version = version;
+            self.inner.store(Arc::new(inner));
+        }
+
+        #[cfg(all(feature = "parking-lot", not(feature = "arc-swap")))]
         {
             let mut inner = self.inner.write();
             if inner.keys[version as usize].is_none() {
                 panic!("cannot promote version {version} before it is stored");
             }
             inner.current_version = version;
-        } // release write lock before notifying subscribers
+        }
+
+        #[cfg(not(any(feature = "arc-swap", feature = "parking-lot")))]
+        {
+            let mut inner = self.inner.write().expect("lock poisoned");
+            if inner.keys[version as usize].is_none() {
+                panic!("cannot promote version {version} before it is stored");
+            }
+            inner.current_version = version;
+        }
+
         let _ = self.rotation_tx.send(version);
     }
 
     /// Combined operation: store the key and immediately promote it to current.
     pub fn apply(&self, version: u8, key: [u8; S]) {
-        self.store_key(version, key);
-        self.promote(version);
+        assert!(
+            (version as usize) < V,
+            "version {} out of range for ring buffer of size {V}",
+            version
+        );
+
+        #[cfg(feature = "arc-swap")]
+        {
+            let mut inner = (**self.inner.load()).clone();
+            inner.keys[version as usize] = Some(key);
+            inner.current_version = version;
+            self.inner.store(Arc::new(inner));
+        }
+
+        #[cfg(all(feature = "parking-lot", not(feature = "arc-swap")))]
+        {
+            let mut inner = self.inner.write();
+            inner.keys[version as usize] = Some(key);
+            inner.current_version = version;
+        }
+
+        #[cfg(not(any(feature = "arc-swap", feature = "parking-lot")))]
+        {
+            let mut inner = self.inner.write().expect("lock poisoned");
+            inner.keys[version as usize] = Some(key);
+            inner.current_version = version;
+        }
+
+        let _ = self.rotation_tx.send(version);
     }
 }
 
@@ -102,7 +226,6 @@ impl<const V: usize, const S: usize> SecretGroup<V, S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
 
     const KEY_A: [u8; 32] = [1u8; 32];
     const KEY_B: [u8; 32] = [2u8; 32];
@@ -141,8 +264,8 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_reads_during_apply_are_safe() {
-        let sg = Arc::new(SecretGroup::<256, 32>::new(0, KEY_A));
-        let sg2 = Arc::clone(&sg);
+        let sg = SecretGroup::<256, 32>::new(0, KEY_A);
+        let sg2 = sg.clone();
 
         let reader = tokio::spawn(async move {
             for _ in 0..1000 {

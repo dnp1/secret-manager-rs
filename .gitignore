@@ -24,3 +24,4 @@ target/
 .env
 .bake/
 .claude/worktrees
+Cargo.lock
