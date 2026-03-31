@@ -20,30 +20,15 @@ pub struct KeyRecord {
 }
 
 /// Storage backend for key rotation.
-///
-/// Implementors provide two operations:
-/// - `load_all` — full scan used for initial hydration at startup.
-/// - `poll_new` — incremental check used by the background syncer.
-///
-/// The trait is intentionally minimal: it does not expose key creation or
-/// deletion, which are administrative operations performed out-of-band.
-///
-/// # Implementations provided
-/// - [`PgSecretBackend`](crate::PgSecretBackend) (feature `postgres`) — PostgreSQL via diesel-async.
 #[async_trait]
 pub trait SecretBackend: Send + Sync + 'static {
     /// The error type returned on backend failures.
     type Error: std::error::Error + Send + Sync + 'static;
 
     /// Load **all** active keys for `group_id`, ordered by `activated_at` ascending.
-    /// Used once at startup to hydrate the in-memory ring buffer.
     async fn load_all(&self, group_id: Uuid) -> Result<Vec<KeyRecord>, Self::Error>;
 
-    /// Return all keys newer than the provided cursor, ordered by
-    /// `activated_at` ascending.
-    ///
-    /// `(since_time, since_id)` forms a stable cursor that avoids skipping keys
-    /// if multiple records share the exact same `activated_at` timestamp.
+    /// Return all keys newer than the provided cursor, ordered by `activated_at` ascending.
     async fn poll_new(
         &self,
         group_id: Uuid,

@@ -1,5 +1,5 @@
 [package]
-name = "secret-manager"
+name = "secret-rotation"
 version = "0.1.0"
 edition = "2024"
 description = "A distributed secret rotation and management library"
@@ -9,20 +9,22 @@ thiserror = "2.0.18"
 tokio = { version = "1.50.0", features = ["full"] }
 tokio-util = { version = "0.7.18", features = ["rt"] }
 async-trait = "0.1.89"
-chrono = { version = "0.4.44", features = ["serde"], optional = true }
+jiff = { version = "0.2.1", features = ["serde"] }
 tracing = "0.1.44"
 uuid = { version = "1.21.0", features = ["serde", "v4"] }
 serde = { version = "1.0.228", features = ["derive"] }
 parking_lot = "0.12.5"
 
-# Optional PostgreSQL Backend
-diesel = { version = "2.3.7", optional = true, features = ["postgres", "chrono", "uuid"] }
-diesel-async = { version = "0.8.0", optional = true, features = ["postgres", "bb8"] }
+# Optional PostgreSQL Backends
+diesel = { version = "2.2.0", optional = true, features = ["postgres", "uuid"] }
+diesel-async = { version = "0.5.0", optional = true, features = ["postgres", "bb8"] }
+jiff-diesel = { version = "0.1.3", optional = true, features = ["postgres"] }
+sqlx = { version = "0.8.3", optional = true, features = ["postgres", "runtime-tokio-rustls", "uuid"] }
+jiff-sqlx = { version = "0.1.1", optional = true, features = ["postgres"] }
 
 [dev-dependencies]
 tokio = { version = "1.50.0", features = ["full", "test-util"] }
-chrono = { version = "0.4.44", features = ["serde"] }
 
 [features]
 default = []
-postgres = ["dep:diesel", "dep:diesel-async", "dep:chrono"]
+postgres = ["dep:diesel", "dep:diesel-async", "dep:jiff-diesel", "dep:sqlx", "dep:jiff-sqlx"]

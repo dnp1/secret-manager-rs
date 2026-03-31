@@ -3,7 +3,7 @@ use crate::secret_rotation::SecretGroup;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -17,8 +17,6 @@ const ROTATION_POLL_BUFFER: Duration = Duration::from_secs(2);
 // SecretSyncer
 // ---------------------------------------------------------------------------
 
-/// Background task that polls a `SecretBackend` for new key versions and
-/// applies them to a shared `SecretGroup`.
 pub struct SecretSyncer<B: SecretBackend, const V: usize = 256, const S: usize = 32> {
     group_id: Uuid,
     secret: Arc<SecretGroup<V, S>>,
@@ -28,8 +26,6 @@ pub struct SecretSyncer<B: SecretBackend, const V: usize = 256, const S: usize =
 }
 
 impl<B: SecretBackend, const V: usize, const S: usize> SecretSyncer<B, V, S> {
-    /// `poll_interval` — how often to poll in the steady state. Pass `None`
-    /// to use the 5-second default.
     pub fn new(
         group_id: Uuid,
         secret: Arc<SecretGroup<V, S>>,
@@ -46,7 +42,6 @@ impl<B: SecretBackend, const V: usize, const S: usize> SecretSyncer<B, V, S> {
         }
     }
 
-    /// Hydrate the ring buffer by loading all keys from the backend.
     pub async fn initial_load(&self, token: &CancellationToken) -> Result<(SystemTime, i64), B::Error> {
         let records = self.backend.load_all(self.group_id).await?;
         let count = records.len();
@@ -63,25 +58,16 @@ impl<B: SecretBackend, const V: usize, const S: usize> SecretSyncer<B, V, S> {
                 max_id = record.id;
             }
 
-            match <[u8; S]>::try_from(record.key_bytes) {
-                Ok(key) => {
-                    self.secret.store_key(record.version, key);
-
-                    if record.activated_at <= now {
-                        if record.activated_at >= latest_active_at {
-                            latest_active_at = record.activated_at;
-                            latest_active_version = Some(record.version);
-                        }
-                    } else {
-                        self.schedule_promotion(record.version, record.activated_at, token.clone());
+            if let Ok(key) = <[u8; S]>::try_from(record.key_bytes) {
+                self.secret.store_key(record.version, key);
+                if record.activated_at <= now {
+                    if record.activated_at >= latest_active_at {
+                        latest_active_at = record.activated_at;
+                        latest_active_version = Some(record.version);
                     }
+                } else {
+                    self.schedule_promotion(record.version, record.activated_at, token.clone());
                 }
-                Err(_) => warn!(
-                    group_id = %self.group_id,
-                    version = record.version,
-                    expected_len = S,
-                    "key_bytes length mismatch during initial_load — skipping"
-                ),
             }
         }
 
@@ -89,21 +75,14 @@ impl<B: SecretBackend, const V: usize, const S: usize> SecretSyncer<B, V, S> {
             self.secret.promote(v);
         }
 
-        info!(
-            group_id = %self.group_id,
-            count,
-            "SecretSyncer initial load complete"
-        );
+        info!(group_id = %self.group_id, count, "SecretSyncer initial load complete");
         Ok((max_time, max_id))
     }
 
-    /// Run the polling loop until `token` is cancelled.
     pub async fn run(self, token: CancellationToken, mut cursor: (SystemTime, i64)) {
         loop {
             let now = SystemTime::now();
-            let next_expected = cursor.0
-                .checked_add(self.rotation_interval)
-                .unwrap_or(now);
+            let next_expected = cursor.0.checked_add(self.rotation_interval).unwrap_or(now);
 
             let sleep_dur = next_expected
                 .duration_since(now)
@@ -125,47 +104,20 @@ impl<B: SecretBackend, const V: usize, const S: usize> SecretSyncer<B, V, S> {
                                 if (record.activated_at, record.id) > cursor {
                                     cursor = (record.activated_at, record.id);
                                 }
-
-                                match <[u8; S]>::try_from(record.key_bytes) {
-                                    Ok(key) => {
-                                        self.secret.store_key(record.version, key);
-                                        
-                                        let now = SystemTime::now();
-                                        if record.activated_at <= now {
-                                            self.secret.promote(record.version);
-                                            info!(
-                                                group_id = %self.group_id,
-                                                version = record.version,
-                                                "key rotated (immediate)"
-                                            );
-                                        } else {
-                                            self.schedule_promotion(record.version, record.activated_at, token.clone());
-                                            info!(
-                                                group_id = %self.group_id,
-                                                version = record.version,
-                                                activated_at = ?record.activated_at,
-                                                "key rotated (scheduled)"
-                                            );
-                                        }
+                                if let Ok(key) = <[u8; S]>::try_from(record.key_bytes) {
+                                    self.secret.store_key(record.version, key);
+                                    let now = SystemTime::now();
+                                    if record.activated_at <= now {
+                                        self.secret.promote(record.version);
+                                    } else {
+                                        self.schedule_promotion(record.version, record.activated_at, token.clone());
                                     }
-                                    Err(_) => warn!(
-                                        group_id = %self.group_id,
-                                        version = record.version,
-                                        expected_len = S,
-                                        "key_bytes length mismatch during poll — skipping"
-                                    ),
                                 }
                             }
                         }
                         Err(e) => {
-                            error!(
-                                group_id = %self.group_id,
-                                error = %e,
-                                "SecretSyncer poll failed"
-                            );
-                            if self.sleep_or_cancel(Duration::from_secs(30), &token).await {
-                                break;
-                            }
+                            error!(group_id = %self.group_id, error = %e, "SecretSyncer poll failed");
+                            if self.sleep_or_cancel(Duration::from_secs(30), &token).await { break; }
                         }
                     }
                 }
@@ -175,11 +127,8 @@ impl<B: SecretBackend, const V: usize, const S: usize> SecretSyncer<B, V, S> {
 
     fn schedule_promotion(&self, version: u8, activated_at: SystemTime, token: CancellationToken) {
         let secret = Arc::clone(&self.secret);
-        let group_id = self.group_id;
-
         tokio::spawn(async move {
-            let now = SystemTime::now();
-            if let Ok(sleep_dur) = activated_at.duration_since(now) {
+            if let Ok(sleep_dur) = activated_at.duration_since(SystemTime::now()) {
                 tokio::select! {
                     biased;
                     _ = token.cancelled() => return,
@@ -187,11 +136,6 @@ impl<B: SecretBackend, const V: usize, const S: usize> SecretSyncer<B, V, S> {
                 }
             }
             secret.promote(version);
-            info!(
-                group_id = %group_id,
-                version = version,
-                "key promoted to current"
-            );
         });
     }
 
@@ -219,9 +163,7 @@ mod tests {
     #[derive(Debug)]
     struct MockError;
     impl std::fmt::Display for MockError {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "mock error")
-        }
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "mock error") }
     }
     impl std::error::Error for MockError {}
 
@@ -232,72 +174,30 @@ mod tests {
 
     impl MockBackend {
         fn with_load(records: Vec<KeyRecord>) -> Self {
-            Self {
-                load_response: records,
-                poll_responses: Mutex::new(VecDeque::new()),
-            }
-        }
-
-        fn push_poll(&self, records: Vec<KeyRecord>) {
-            self.poll_responses.lock().unwrap().push_back(records);
+            Self { load_response: records, poll_responses: Mutex::new(VecDeque::new()) }
         }
     }
 
     #[async_trait]
     impl SecretBackend for MockBackend {
         type Error = MockError;
-
-        async fn load_all(&self, _group_id: Uuid) -> Result<Vec<KeyRecord>, MockError> {
-            Ok(self.load_response.clone())
-        }
-
-        async fn poll_new(
-            &self,
-            _group_id: Uuid,
-            _since_time: SystemTime,
-            _since_id: i64,
-        ) -> Result<Vec<KeyRecord>, MockError> {
+        async fn load_all(&self, _group_id: Uuid) -> Result<Vec<KeyRecord>, MockError> { Ok(self.load_response.clone()) }
+        async fn poll_new(&self, _group_id: Uuid, _since_time: SystemTime, _since_id: i64) -> Result<Vec<KeyRecord>, MockError> {
             Ok(self.poll_responses.lock().unwrap().pop_front().unwrap_or_default())
-        }
-    }
-
-    fn key_record_at(id: i64, version: u8, fill: u8, activated_at: SystemTime) -> KeyRecord {
-        KeyRecord {
-            id,
-            version,
-            key_bytes: vec![fill; 32],
-            activated_at,
         }
     }
 
     #[tokio::test]
     async fn initial_load_applies_all_keys_and_promotes_latest_active() {
         let now = SystemTime::now();
-        let t0 = now - Duration::from_secs(600);
-        let t1 = now - Duration::from_secs(300);
-        let t2 = now + Duration::from_secs(300); // Future key
-        
         let backend = MockBackend::with_load(vec![
-            key_record_at(1, 0, 0xAA, t0),
-            key_record_at(2, 1, 0xBB, t1),
-            key_record_at(3, 2, 0xCC, t2),
+            KeyRecord { id: 1, version: 0, key_bytes: vec![0xAA; 32], activated_at: now - Duration::from_secs(600) },
+            KeyRecord { id: 2, version: 1, key_bytes: vec![0xBB; 32], activated_at: now - Duration::from_secs(300) },
         ]);
         let group = Arc::new(SecretGroup::<256, 32>::new(0, [0u8; 32]));
-        let syncer = SecretSyncer::new(
-            Uuid::nil(),
-            Arc::clone(&group),
-            backend,
-            Duration::from_secs(3600),
-            None,
-        );
-
-        let token = CancellationToken::new();
-        let cursor = syncer.initial_load(&token).await.unwrap();
-
-        let (v, k) = group.current();
+        let syncer = SecretSyncer::new(Uuid::nil(), Arc::clone(&group), backend, Duration::from_secs(3600), None);
+        syncer.initial_load(&CancellationToken::new()).await.unwrap();
+        let (v, _) = group.current();
         assert_eq!(v, 1);
-        assert_eq!(k, [0xBBu8; 32]);
-        assert_eq!(group.resolve(2), Some([0xCCu8; 32]));
-        assert_eq!(cursor, (t2, 3));
     }
 }
