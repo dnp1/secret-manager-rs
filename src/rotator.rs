@@ -1,0 +1,314 @@
+use async_trait::async_trait;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
+use tokio_util::sync::CancellationToken;
+use tracing::{error, info};
+use uuid::Uuid;
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/// Back-off on backend errors before retrying the full loop.
+const ERROR_RETRY_DELAY: Duration = Duration::from_secs(30);
+
+// ---------------------------------------------------------------------------
+// SecretRotationBackend — write-side trait
+// ---------------------------------------------------------------------------
+
+/// Write-side storage contract for key rotation.
+///
+/// Intentionally separate from [`SecretBackend`](crate::SecretBackend)
+/// (read-only) so the two concerns can be mocked independently in tests and
+/// implemented on different types if needed.
+#[async_trait]
+pub trait SecretRotationBackend: Send + Sync + 'static {
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Returns `(version, activated_at)` of the most recently **inserted** key
+    /// for `group_id` (by insertion order, not `activated_at`), or `None` if no
+    /// key exists yet.
+    async fn latest_key_info(
+        &self,
+        group_id: Uuid,
+    ) -> Result<Option<(u8, SystemTime)>, Self::Error>;
+
+    /// Acquires a `pg_advisory_xact_lock`, re-reads the latest version inside
+    /// the lock, and inserts only if the current version still matches
+    /// `expected_version`.
+    ///
+    /// Returns `Ok(true)` when the row was inserted, `Ok(false)` when another
+    /// instance rotated inside the lock window (current version ≠
+    /// `expected_version`).
+    ///
+    /// `activated_at` should be set to `now() + propagation_delay` by the
+    /// caller so all synced instances load the key before it starts being used.
+    async fn try_insert_key(
+        &self,
+        group_id: Uuid,
+        expected_version: Option<u8>,
+        new_version: u8,
+        key_bytes: &[u8],
+        activated_at: SystemTime,
+    ) -> Result<bool, Self::Error>;
+}
+
+// ---------------------------------------------------------------------------
+// KeyRotator
+// ---------------------------------------------------------------------------
+
+/// Scheduled key generator with cross-instance serialisation via PostgreSQL
+/// advisory locks.
+///
+/// ## How it works
+///
+/// Each iteration of the `run` loop:
+/// 1. Queries the backend for the most recent key's `activated_at`.
+/// 2. Sleeps until `last_activated_at + rotation_interval` (or immediately if
+///    no key exists yet).
+/// 3. Calls `try_insert_key`, which internally handles distributed coordination.
+pub struct KeyRotator<B: SecretRotationBackend, const S: usize = 32> {
+    group_id: Uuid,
+    backend: B,
+    rotation_interval: Duration,
+    propagation_delay: Duration,
+    generate_key: Arc<dyn Fn() -> [u8; S] + Send + Sync + 'static>,
+}
+
+impl<B: SecretRotationBackend, const S: usize> KeyRotator<B, S> {
+    pub fn new(
+        group_id: Uuid,
+        backend: B,
+        rotation_interval: Duration,
+        propagation_delay: Duration,
+        generate_key: impl Fn() -> [u8; S] + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            group_id,
+            backend,
+            rotation_interval,
+            propagation_delay,
+            generate_key: Arc::new(generate_key),
+        }
+    }
+
+    /// Run the rotation loop until `token` is cancelled.
+    ///
+    /// Backend errors are logged; the loop retries after `ERROR_RETRY_DELAY`
+    /// rather than propagating.
+    pub async fn run(self, token: CancellationToken) {
+        info!(group_id = %self.group_id, "KeyRotator starting");
+
+        loop {
+            // ── Step 1: query latest key ─────────────────────────────────────
+            let pre_info = match self.backend.latest_key_info(self.group_id).await {
+                Ok(info) => info,
+                Err(e) => {
+                    error!(group_id = %self.group_id, error = %e,
+                        "KeyRotator: backend error querying latest key info");
+                    if sleep_or_cancel(ERROR_RETRY_DELAY, &token).await {
+                        break;
+                    }
+                    continue;
+                }
+            };
+
+            // ── Step 2: compute remaining time until next rotation ────────────
+            let sleep_dur = match pre_info {
+                Some((_, last_activated_at)) => {
+                    last_activated_at
+                        .checked_add(self.rotation_interval)
+                        .and_then(|next| next.duration_since(SystemTime::now()).ok())
+                        .unwrap_or(Duration::ZERO)
+                }
+                None => Duration::ZERO, // no key yet → rotate immediately
+            };
+
+            // ── Step 3: sleep until due ──────────────────────────────────────
+            if sleep_or_cancel(sleep_dur, &token).await {
+                break;
+            }
+
+            // ── Step 4: generate + try_insert (advisory lock + re-check inside)
+            let expected_version = pre_info.map(|(v, _)| v);
+            let new_version = expected_version.map(|v| v.wrapping_add(1)).unwrap_or(0);
+            let key_bytes = (self.generate_key)();
+            let activated_at = SystemTime::now() + self.propagation_delay;
+
+            match self
+                .backend
+                .try_insert_key(
+                    self.group_id,
+                    expected_version,
+                    new_version,
+                    &key_bytes,
+                    activated_at,
+                )
+                .await
+            {
+                Ok(true) => {
+                    info!(
+                        group_id = %self.group_id,
+                        version = new_version,
+                        "KeyRotator: new key inserted"
+                    );
+                }
+                Ok(false) => {
+                    info!(
+                        group_id = %self.group_id,
+                        "KeyRotator: another instance rotated — skipping"
+                    );
+                }
+                Err(e) => {
+                    error!(
+                        group_id = %self.group_id,
+                        version = new_version,
+                        error = %e,
+                        "KeyRotator: try_insert_key failed"
+                    );
+                    if sleep_or_cancel(ERROR_RETRY_DELAY, &token).await {
+                        break;
+                    }
+                }
+            }
+        }
+
+        info!(group_id = %self.group_id, "KeyRotator: shutting down");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+async fn sleep_or_cancel(duration: Duration, token: &CancellationToken) -> bool {
+    tokio::select! {
+        biased;
+        _ = token.cancelled() => true,
+        _ = tokio::time::sleep(duration) => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    #[derive(Debug, PartialEq)]
+    struct MockError;
+    impl std::fmt::Display for MockError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "mock error")
+        }
+    }
+    impl std::error::Error for MockError {}
+
+    #[derive(Debug)]
+    struct TryInsertCall {
+        expected_version: Option<u8>,
+        new_version: u8,
+        key_bytes: Vec<u8>,
+        activated_at: SystemTime,
+    }
+
+    struct MockRotationBackend {
+        latest_queue: Mutex<VecDeque<Option<(u8, SystemTime)>>>,
+        insert_results: Mutex<VecDeque<Result<bool, MockError>>>,
+        inserted: Arc<Mutex<Vec<TryInsertCall>>>,
+    }
+
+    impl MockRotationBackend {
+        fn new(inserted: Arc<Mutex<Vec<TryInsertCall>>>) -> Self {
+            Self {
+                latest_queue: Mutex::new(VecDeque::new()),
+                insert_results: Mutex::new(VecDeque::new()),
+                inserted,
+            }
+        }
+        fn push_latest(&self, v: Option<(u8, SystemTime)>) {
+            self.latest_queue.lock().unwrap().push_back(v);
+        }
+        fn push_insert_result(&self, r: Result<bool, MockError>) {
+            self.insert_results.lock().unwrap().push_back(r);
+        }
+    }
+
+    #[async_trait]
+    impl SecretRotationBackend for MockRotationBackend {
+        type Error = MockError;
+
+        async fn latest_key_info(
+            &self,
+            _group_id: Uuid,
+        ) -> Result<Option<(u8, SystemTime)>, MockError> {
+            Ok(self.latest_queue.lock().unwrap().pop_front().flatten())
+        }
+
+        async fn try_insert_key(
+            &self,
+            _group_id: Uuid,
+            expected_version: Option<u8>,
+            new_version: u8,
+            key_bytes: &[u8],
+            activated_at: SystemTime,
+        ) -> Result<bool, MockError> {
+            let result = self
+                .insert_results
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Ok(true));
+            if result == Ok(true) {
+                self.inserted.lock().unwrap().push(TryInsertCall {
+                    expected_version,
+                    new_version,
+                    key_bytes: key_bytes.to_vec(),
+                    activated_at,
+                });
+            }
+            result
+        }
+    }
+
+    fn make_rotator(
+        group_id: Uuid,
+        backend: MockRotationBackend,
+    ) -> KeyRotator<MockRotationBackend, 32> {
+        KeyRotator::new(
+            group_id,
+            backend,
+            Duration::from_secs(3600),
+            Duration::from_secs(120),
+            || [42u8; 32],
+        )
+    }
+
+    #[tokio::test]
+    async fn rotates_immediately_when_no_key_exists() {
+        let inserted = Arc::new(Mutex::new(vec![]));
+        let backend = MockRotationBackend::new(Arc::clone(&inserted));
+        backend.push_latest(None);
+        backend.push_latest(Some((0, SystemTime::now())));
+
+        let group_id = Uuid::new_v4();
+        let token = CancellationToken::new();
+        let rotator = make_rotator(group_id, backend);
+
+        let tc = token.clone();
+        let handle = tokio::spawn(async move { rotator.run(tc).await });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        token.cancel();
+        handle.await.unwrap();
+
+        let calls = inserted.lock().unwrap();
+        assert_eq!(calls.len(), 1, "expected exactly one insertion");
+        assert_eq!(calls[0].expected_version, None);
+        assert_eq!(calls[0].new_version, 0);
+    }
+}

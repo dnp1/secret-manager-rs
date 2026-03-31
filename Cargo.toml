@@ -1,0 +1,28 @@
+[package]
+name = "secret-manager"
+version = "0.1.0"
+edition = "2024"
+description = "A distributed secret rotation and management library"
+
+[dependencies]
+thiserror = "2.0.18"
+tokio = { version = "1.50.0", features = ["full"] }
+tokio-util = { version = "0.7.18", features = ["rt"] }
+async-trait = "0.1.89"
+chrono = { version = "0.4.44", features = ["serde"], optional = true }
+tracing = "0.1.44"
+uuid = { version = "1.21.0", features = ["serde", "v4"] }
+serde = { version = "1.0.228", features = ["derive"] }
+parking_lot = "0.12.5"
+
+# Optional PostgreSQL Backend
+diesel = { version = "2.3.7", optional = true, features = ["postgres", "chrono", "uuid"] }
+diesel-async = { version = "0.8.0", optional = true, features = ["postgres", "bb8"] }
+
+[dev-dependencies]
+tokio = { version = "1.50.0", features = ["full", "test-util"] }
+chrono = { version = "0.4.44", features = ["serde"] }
+
+[features]
+default = []
+postgres = ["dep:diesel", "dep:diesel-async", "dep:chrono"]
