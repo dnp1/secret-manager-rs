@@ -75,34 +75,52 @@ impl<B: SecretRotationBackend, const S: usize> KeyRotator<B, S> {
                 Ok(info) => info,
                 Err(e) => {
                     error!(group_id = %self.group_id, error = %e, "KeyRotator: backend error");
-                    if sleep_or_cancel(ERROR_RETRY_DELAY, &token).await { break; }
+                    if sleep_or_cancel(ERROR_RETRY_DELAY, &token).await {
+                        break;
+                    }
                     continue;
                 }
             };
 
             let sleep_dur = match pre_info {
-                Some((_, last_activated_at)) => {
-                    last_activated_at
-                        .checked_add(self.rotation_interval)
-                        .and_then(|next| next.duration_since(SystemTime::now()).ok())
-                        .unwrap_or(Duration::ZERO)
-                }
+                Some((_, last_activated_at)) => last_activated_at
+                    .checked_add(self.rotation_interval)
+                    .and_then(|next| next.duration_since(SystemTime::now()).ok())
+                    .unwrap_or(Duration::ZERO),
                 None => Duration::ZERO,
             };
 
-            if sleep_or_cancel(sleep_dur, &token).await { break; }
+            if sleep_or_cancel(sleep_dur, &token).await {
+                break;
+            }
 
             let expected_version = pre_info.map(|(v, _)| v);
             let new_version = expected_version.map(|v| v.wrapping_add(1)).unwrap_or(0);
             let key_bytes = (self.generate_key)();
             let activated_at = SystemTime::now() + self.propagation_delay;
 
-            match self.backend.try_insert_key(self.group_id, expected_version, new_version, &key_bytes, activated_at).await {
-                Ok(true) => info!(group_id = %self.group_id, version = new_version, "KeyRotator: new key inserted"),
-                Ok(false) => info!(group_id = %self.group_id, "KeyRotator: another instance rotated"),
+            match self
+                .backend
+                .try_insert_key(
+                    self.group_id,
+                    expected_version,
+                    new_version,
+                    &key_bytes,
+                    activated_at,
+                )
+                .await
+            {
+                Ok(true) => {
+                    info!(group_id = %self.group_id, version = new_version, "KeyRotator: new key inserted")
+                }
+                Ok(false) => {
+                    info!(group_id = %self.group_id, "KeyRotator: another instance rotated")
+                }
                 Err(e) => {
                     error!(group_id = %self.group_id, error = %e, "KeyRotator: try_insert_key failed");
-                    if sleep_or_cancel(ERROR_RETRY_DELAY, &token).await { break; }
+                    if sleep_or_cancel(ERROR_RETRY_DELAY, &token).await {
+                        break;
+                    }
                 }
             }
         }
@@ -131,7 +149,9 @@ mod tests {
     #[derive(Debug, PartialEq)]
     struct MockError;
     impl std::fmt::Display for MockError {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "mock error") }
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "mock error")
+        }
     }
     impl std::error::Error for MockError {}
 
@@ -165,15 +185,33 @@ mod tests {
     impl SecretRotationBackend for MockRotationBackend {
         type Error = MockError;
 
-        async fn latest_key_info(&self, _group_id: Uuid) -> Result<Option<(u8, SystemTime)>, MockError> {
+        async fn latest_key_info(
+            &self,
+            _group_id: Uuid,
+        ) -> Result<Option<(u8, SystemTime)>, MockError> {
             Ok(self.latest_queue.lock().unwrap().pop_front().flatten())
         }
 
-        async fn try_insert_key(&self, _group_id: Uuid, expected_version: Option<u8>, new_version: u8, key_bytes: &[u8], activated_at: SystemTime) -> Result<bool, MockError> {
-            let result = self.insert_results.lock().unwrap().pop_front().unwrap_or(Ok(true));
+        async fn try_insert_key(
+            &self,
+            _group_id: Uuid,
+            expected_version: Option<u8>,
+            new_version: u8,
+            key_bytes: &[u8],
+            activated_at: SystemTime,
+        ) -> Result<bool, MockError> {
+            let result = self
+                .insert_results
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Ok(true));
             if result == Ok(true) {
                 self.inserted.lock().unwrap().push(TryInsertCall {
-                    expected_version, new_version, key_bytes: key_bytes.to_vec(), activated_at,
+                    expected_version,
+                    new_version,
+                    key_bytes: key_bytes.to_vec(),
+                    activated_at,
                 });
             }
             result
@@ -187,7 +225,13 @@ mod tests {
         backend.push_latest(None);
         backend.push_latest(Some((0, SystemTime::now())));
 
-        let rotator = KeyRotator::new(Uuid::new_v4(), backend, Duration::from_secs(3600), Duration::from_secs(120), || [42u8; 32]);
+        let rotator = KeyRotator::new(
+            Uuid::new_v4(),
+            backend,
+            Duration::from_secs(3600),
+            Duration::from_secs(120),
+            || [42u8; 32],
+        );
         let token = CancellationToken::new();
         let tc = token.clone();
         let handle = tokio::spawn(async move { rotator.run(tc).await });

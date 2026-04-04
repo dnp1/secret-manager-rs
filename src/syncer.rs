@@ -1,5 +1,5 @@
-use crate::backend::{SecretBackend, EPOCH_CURSOR};
-use crate::secret_rotation::SecretGroup;
+use crate::backend::{EPOCH_CURSOR, SecretBackend};
+use crate::secret_rotation::InMemorySecretGroup;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio_util::sync::CancellationToken;
@@ -19,7 +19,7 @@ const ROTATION_POLL_BUFFER: Duration = Duration::from_secs(2);
 
 pub struct SecretSyncer<B: SecretBackend, const V: usize = 256, const S: usize = 32> {
     group_id: Uuid,
-    secret: Arc<SecretGroup<V, S>>,
+    secret: Arc<InMemorySecretGroup<V, S>>,
     backend: B,
     rotation_interval: Duration,
     poll_interval: Duration,
@@ -28,7 +28,7 @@ pub struct SecretSyncer<B: SecretBackend, const V: usize = 256, const S: usize =
 impl<B: SecretBackend, const V: usize, const S: usize> SecretSyncer<B, V, S> {
     pub fn new(
         group_id: Uuid,
-        secret: Arc<SecretGroup<V, S>>,
+        secret: Arc<InMemorySecretGroup<V, S>>,
         backend: B,
         rotation_interval: Duration,
         poll_interval: Option<Duration>,
@@ -42,7 +42,10 @@ impl<B: SecretBackend, const V: usize, const S: usize> SecretSyncer<B, V, S> {
         }
     }
 
-    pub async fn initial_load(&self, token: &CancellationToken) -> Result<(SystemTime, i64), B::Error> {
+    pub async fn initial_load(
+        &self,
+        token: &CancellationToken,
+    ) -> Result<(SystemTime, i64), B::Error> {
         let records = self.backend.load_all(self.group_id).await?;
         let count = records.len();
         let mut max_time = EPOCH_CURSOR;
@@ -156,6 +159,7 @@ impl<B: SecretBackend, const V: usize, const S: usize> SecretSyncer<B, V, S> {
 mod tests {
     use super::*;
     use crate::backend::KeyRecord;
+    use crate::secret_rotation::SecretGroup;
     use async_trait::async_trait;
     use std::collections::VecDeque;
     use std::sync::Mutex;
@@ -163,7 +167,9 @@ mod tests {
     #[derive(Debug)]
     struct MockError;
     impl std::fmt::Display for MockError {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "mock error") }
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "mock error")
+        }
     }
     impl std::error::Error for MockError {}
 
@@ -174,16 +180,31 @@ mod tests {
 
     impl MockBackend {
         fn with_load(records: Vec<KeyRecord>) -> Self {
-            Self { load_response: records, poll_responses: Mutex::new(VecDeque::new()) }
+            Self {
+                load_response: records,
+                poll_responses: Mutex::new(VecDeque::new()),
+            }
         }
     }
 
     #[async_trait]
     impl SecretBackend for MockBackend {
         type Error = MockError;
-        async fn load_all(&self, _group_id: Uuid) -> Result<Vec<KeyRecord>, MockError> { Ok(self.load_response.clone()) }
-        async fn poll_new(&self, _group_id: Uuid, _since_time: SystemTime, _since_id: i64) -> Result<Vec<KeyRecord>, MockError> {
-            Ok(self.poll_responses.lock().unwrap().pop_front().unwrap_or_default())
+        async fn load_all(&self, _group_id: Uuid) -> Result<Vec<KeyRecord>, MockError> {
+            Ok(self.load_response.clone())
+        }
+        async fn poll_new(
+            &self,
+            _group_id: Uuid,
+            _since_time: SystemTime,
+            _since_id: i64,
+        ) -> Result<Vec<KeyRecord>, MockError> {
+            Ok(self
+                .poll_responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_default())
         }
     }
 
@@ -191,12 +212,31 @@ mod tests {
     async fn initial_load_applies_all_keys_and_promotes_latest_active() {
         let now = SystemTime::now();
         let backend = MockBackend::with_load(vec![
-            KeyRecord { id: 1, version: 0, key_bytes: vec![0xAA; 32], activated_at: now - Duration::from_secs(600) },
-            KeyRecord { id: 2, version: 1, key_bytes: vec![0xBB; 32], activated_at: now - Duration::from_secs(300) },
+            KeyRecord {
+                id: 1,
+                version: 0,
+                key_bytes: vec![0xAA; 32],
+                activated_at: now - Duration::from_secs(600),
+            },
+            KeyRecord {
+                id: 2,
+                version: 1,
+                key_bytes: vec![0xBB; 32],
+                activated_at: now - Duration::from_secs(300),
+            },
         ]);
-        let group = Arc::new(SecretGroup::<256, 32>::new(0, [0u8; 32]));
-        let syncer = SecretSyncer::new(Uuid::nil(), Arc::clone(&group), backend, Duration::from_secs(3600), None);
-        syncer.initial_load(&CancellationToken::new()).await.unwrap();
+        let group = Arc::new(InMemorySecretGroup::<256, 32>::new(0, [0u8; 32]));
+        let syncer = SecretSyncer::new(
+            Uuid::nil(),
+            Arc::clone(&group),
+            backend,
+            Duration::from_secs(3600),
+            None,
+        );
+        syncer
+            .initial_load(&CancellationToken::new())
+            .await
+            .unwrap();
         let (v, _) = group.current();
         assert_eq!(v, 1);
     }
