@@ -202,7 +202,7 @@ mod tests {
     const MIGRATIONS: EmbeddedMigrations = embed_migrations!("tests/diesel-migrations");
 
     async fn make_backend() -> (PostgresTestDb, DieselPgSecretBackend) {
-        let db = PostgresTestDb::create("secret-rotation-diesel", MIGRATIONS, None, None).await;
+        let db = PostgresTestDb::create("secret-manager-diesel", MIGRATIONS, None, None).await;
         let backend = DieselPgSecretBackend::new(db.pool());
         (db, backend)
     }

@@ -1,8 +1,7 @@
 use async_trait::async_trait;
 use aws_sdk_kms::Client as KmsClient;
 use aws_sdk_kms::primitives::Blob;
-use crate::encryptor::{Encrypted, KeyEncryptor};
-use anyhow::Result;
+use crate::encryptor::{Encrypted, EncryptorError, KeyEncryptor};
 
 /// [`KeyEncryptor`] backed by AWS Key Management Service (KMS).
 ///
@@ -38,13 +37,14 @@ impl KmsEncryptor {
 
 #[async_trait]
 impl KeyEncryptor for KmsEncryptor {
-    async fn encrypt(&self, plaintext: &[u8]) -> Result<Encrypted> {
+    async fn encrypt(&self, plaintext: &[u8]) -> Result<Encrypted, EncryptorError> {
         let resp = self.client
             .encrypt()
             .key_id(&self.key_id)
             .plaintext(Blob::new(plaintext))
             .send()
-            .await?;
+            .await
+            .map_err(|e| EncryptorError::Kms(Box::new(e)))?;
 
         Ok(Encrypted {
             ciphertext: resp.ciphertext_blob.unwrap().into_inner(),
@@ -53,12 +53,13 @@ impl KeyEncryptor for KmsEncryptor {
         })
     }
 
-    async fn decrypt(&self, encrypted: &Encrypted) -> Result<Vec<u8>> {
+    async fn decrypt(&self, encrypted: &Encrypted) -> Result<Vec<u8>, EncryptorError> {
         let resp = self.client
             .decrypt()
             .ciphertext_blob(Blob::new(encrypted.ciphertext.clone()))
             .send()
-            .await?;
+            .await
+            .map_err(|e| EncryptorError::Kms(Box::new(e)))?;
 
         Ok(resp.plaintext.unwrap().into_inner())
     }

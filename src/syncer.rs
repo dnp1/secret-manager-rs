@@ -347,7 +347,7 @@ mod tests {
     use crate::encryptor::Encrypted;
     use crate::no_op_encryptor::NoOpEncryptor;
     use crate::secret_rotation::SecretGroup;
-    use anyhow::Result as AnyResult;
+    use crate::encryptor::EncryptorError;
     use async_trait::async_trait;
     use std::collections::VecDeque;
     use std::sync::Mutex;
@@ -426,10 +426,10 @@ mod tests {
 
     #[async_trait]
     impl KeyEncryptor for CountingEncryptor {
-        async fn encrypt(&self, plaintext: &[u8]) -> AnyResult<Encrypted> {
+        async fn encrypt(&self, plaintext: &[u8]) -> Result<Encrypted, EncryptorError> {
             Ok(Encrypted { ciphertext: plaintext.to_vec(), nonce: None, key_version: 0 })
         }
-        async fn decrypt(&self, enc: &Encrypted) -> AnyResult<Vec<u8>> {
+        async fn decrypt(&self, enc: &Encrypted) -> Result<Vec<u8>, EncryptorError> {
             *self.decrypt_calls.lock().unwrap() += 1;
             Ok(enc.ciphertext.clone())
         }

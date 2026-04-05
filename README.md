@@ -2,13 +2,16 @@
 
 [![Crates.io](https://img.shields.io/crates/v/secret-manager.svg)](https://crates.io/crates/secret-manager)
 [![docs.rs](https://docs.rs/secret-manager/badge.svg)](https://docs.rs/secret-manager)
-[![codecov](https://codecov.io/gh/dnp1/secret-rotation-rs/branch/main/graph/badge.svg)](https://codecov.io/gh/dnp1/secret-rotation-rs)
+[![codecov](https://codecov.io/gh/dnp1/secret-manager-rs/branch/main/graph/badge.svg)](https://codecov.io/gh/dnp1/secret-manager-rs)
 
 Distributed secret-key rotation and in-process caching for Rust services.
 
 ## Overview
 
-`secret-manager` manages a ring buffer of versioned encryption keys shared across a cluster. Keys are generated, encrypted, and persisted by a **rotator**; they are fetched, decrypted, and cached in memory by a **syncer**. The two roles are intentionally decoupled so you can deploy them in whatever topology fits your system.
+`secret-manager` manages a ring buffer of versioned encryption keys shared across a cluster. 
+Keys are generated, encrypted, and persisted by a **rotator**; 
+they are fetched, decrypted, and cached in memory by a **syncer**. 
+The two roles are intentionally decoupled so you can deploy them in whatever topology fits your system.
 
 ## Features
 

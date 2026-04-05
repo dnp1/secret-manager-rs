@@ -1,5 +1,4 @@
-use crate::encryptor::{Encrypted, KeyEncryptor};
-use anyhow::{Result, anyhow};
+use crate::encryptor::{Encrypted, EncryptorError, KeyEncryptor};
 use async_trait::async_trait;
 
 /// A passthrough [`KeyEncryptor`] that stores key bytes as-is (no encryption).
@@ -11,7 +10,7 @@ pub struct NoOpEncryptor;
 
 #[async_trait]
 impl KeyEncryptor for NoOpEncryptor {
-    async fn encrypt(&self, plaintext: &[u8]) -> Result<Encrypted> {
+    async fn encrypt(&self, plaintext: &[u8]) -> Result<Encrypted, EncryptorError> {
         Ok(Encrypted {
             ciphertext: plaintext.to_vec(),
             nonce: None,
@@ -19,12 +18,9 @@ impl KeyEncryptor for NoOpEncryptor {
         })
     }
 
-    async fn decrypt(&self, encrypted: &Encrypted) -> Result<Vec<u8>> {
+    async fn decrypt(&self, encrypted: &Encrypted) -> Result<Vec<u8>, EncryptorError> {
         if encrypted.key_version != 0 {
-            return Err(anyhow!(
-                "NoOpEncryptor cannot decrypt key_version {}",
-                encrypted.key_version
-            ));
+            return Err(EncryptorError::WrongKeyVersion(encrypted.key_version));
         }
         Ok(encrypted.ciphertext.clone())
     }
@@ -59,6 +55,6 @@ mod tests {
 
         let result = encryptor.decrypt(&encrypted).await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("NoOpEncryptor cannot decrypt key_version 1"));
+        assert!(result.unwrap_err().to_string().contains("wrong key version"));
     }
 }

@@ -1,7 +1,6 @@
-use crate::encryptor::{Encrypted, KeyEncryptor};
+use crate::encryptor::{Encrypted, EncryptorError, KeyEncryptor};
 use aes_gcm_siv::aead::{Aead, KeyInit};
 use aes_gcm_siv::{Aes256GcmSiv, Nonce};
-use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use rand::{Rng, rng};
 
@@ -41,7 +40,7 @@ impl LocalEncryptor {
 
 #[async_trait]
 impl KeyEncryptor for LocalEncryptor {
-    async fn encrypt(&self, plaintext: &[u8]) -> Result<Encrypted> {
+    async fn encrypt(&self, plaintext: &[u8]) -> Result<Encrypted, EncryptorError> {
         let mut nonce_bytes = [0u8; 12];
         rng().fill_bytes(&mut nonce_bytes);
         let nonce = Nonce::from(nonce_bytes);
@@ -49,7 +48,7 @@ impl KeyEncryptor for LocalEncryptor {
         let ciphertext = self
             .cipher()
             .encrypt(&nonce, plaintext)
-            .map_err(|e| anyhow!("local encryption failed: {:?}", e))?;
+            .map_err(|e| EncryptorError::EncryptionFailed(format!("{e:?}")))?;
 
         Ok(Encrypted {
             ciphertext,
@@ -58,16 +57,13 @@ impl KeyEncryptor for LocalEncryptor {
         })
     }
 
-    async fn decrypt(&self, encrypted: &Encrypted) -> Result<Vec<u8>> {
-        let nonce_bytes = encrypted
-            .nonce
-            .ok_or_else(|| anyhow!("missing nonce for local decryption"))?;
-
+    async fn decrypt(&self, encrypted: &Encrypted) -> Result<Vec<u8>, EncryptorError> {
+        let nonce_bytes = encrypted.nonce.ok_or(EncryptorError::MissingNonce)?;
         let nonce = Nonce::from(nonce_bytes);
 
         self.cipher()
             .decrypt(&nonce, encrypted.ciphertext.as_ref())
-            .map_err(|e| anyhow!("local decryption failed: {:?}", e))
+            .map_err(|e| EncryptorError::DecryptionFailed(format!("{e:?}")))
     }
 }
 

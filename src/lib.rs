@@ -182,7 +182,7 @@ pub type GroupId = String;
 
 
 pub use backend::{KeyRecord, SecretBackend};
-pub use encryptor::{Encrypted, KeyEncryptor};
+pub use encryptor::{Encrypted, EncryptorError, KeyEncryptor};
 pub use local_encryptor::LocalEncryptor;
 pub use manager::{SecretManager, SecretManagerHandle};
 pub use no_op_encryptor::NoOpEncryptor;

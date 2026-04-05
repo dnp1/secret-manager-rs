@@ -154,7 +154,7 @@ mod tests {
     static MIGRATIONS: sqlx::migrate::Migrator = sqlx::migrate!("tests/sqlx-migrations");
 
     async fn make_backend() -> (PostgresTestDb, SqlxPgSecretBackend) {
-        let db = PostgresTestDb::create("secret-rotation-sqlx", &MIGRATIONS, None, None).await;
+        let db = PostgresTestDb::create("secret-manager-sqlx", &MIGRATIONS, None, None).await;
         let backend = SqlxPgSecretBackend::new(db.pool());
         (db, backend)
     }
