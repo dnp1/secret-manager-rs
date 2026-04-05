@@ -6,7 +6,7 @@ description = "A distributed secret rotation and management library"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/dnp1/test-containers-util"
 keywords = ["secrets", "password", "security"]
-categories = ["development-tools::security"]
+categories = ["security"]
 
 [dependencies]
 thiserror = "2.0.18"
